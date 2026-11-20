@@ -1,7 +1,10 @@
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from uuid import UUID
 
 import httpx2
 import pytest
@@ -9,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from experiment.aci import RepositoryACI
 from experiment import model as model_adapter
+from run_agent import choose_mode
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / 'examples' / 'pagination'
@@ -62,7 +66,8 @@ def failing_model(messages):
 
 def cli(workspace, *args, model='scripted_model'):
     return subprocess.run([sys.executable, '-c', DRIVER, __file__, str(workspace), model, *args],
-                          cwd=ROOT, capture_output=True, text=True, encoding='utf-8',
+                          cwd=ROOT, env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+                          capture_output=True, text=True, encoding='utf-8',
                           timeout=30, check=False)
 
 
@@ -71,15 +76,41 @@ def trace(workspace, name):
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
 
 
+@pytest.mark.parametrize('reply, mode', [('', 'copy'), ('2', 'in-place')])
+def test_choose_mode_prompts_in_terminal(monkeypatch, reply, mode):
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return reply
+
+    monkeypatch.setattr('builtins.input', answer)
+    assert choose_mode(None) == mode
+    assert 'edit original repository' in prompts[0]
+
+
+@pytest.mark.parametrize('mode', ['copy', 'in-place'])
 @pytest.mark.parametrize('decision', ['--approve', '--reject'])
-def test_approval_survives_process_exit(tmp_path, decision):
-    started = cli(tmp_path, 'start', 'pagination', '--repo', str(EXAMPLE / 'repo'),
+def test_approval_survives_process_exit(tmp_path, decision, mode):
+    original = tmp_path / 'original'
+    shutil.copytree(EXAMPLE, original)
+    started = cli(tmp_path, 'start', 'pagination', f'--{mode}', '--repo', str(original),
                   '--issue-file', str(EXAMPLE / 'issue.md'))
     assert started.returncode == 0, started.stderr
     assert 'Approval required' in started.stdout
+    issue_title = (EXAMPLE / 'issue.md').read_text(encoding='utf-8').splitlines()[0]
+    assert f'Issue: {issue_title}' in started.stdout
     assert NEW in started.stdout
-    working_file = tmp_path / 'runs' / 'pagination' / 'repo' / 'pagination.py'
+    run_directory = tmp_path / 'runs' / 'pagination'
+    working_file = (run_directory / 'repo' if mode == 'copy' else original) / 'pagination.py'
+    assert f'Repository: {working_file.parent} ({mode})' in started.stdout
     assert OLD in working_file.read_text(encoding='utf-8')
+    if mode == 'in-place':
+        assert not (run_directory / 'repo').exists()
+    if mode == 'copy' and decision == '--reject':
+        (run_directory / 'target.json').unlink()  # Legacy copy run format.
 
     resumed = cli(tmp_path, 'resume', 'pagination', decision, '--comment', 'reviewed')
     assert resumed.returncode == 0, resumed.stderr
@@ -95,11 +126,12 @@ def test_approval_survives_process_exit(tmp_path, decision):
         assert OLD in working_file.read_text(encoding='utf-8')
         assert results[-1]['result']['comment'] == 'reviewed'
         assert rows[-1]['steps'] == 4
-    assert OLD in (EXAMPLE / 'repo' / 'pagination.py').read_text(encoding='utf-8')
+    expected_original = NEW if mode == 'in-place' and decision == '--approve' else OLD
+    assert expected_original in (original / 'pagination.py').read_text(encoding='utf-8')
 
 
 def test_resume_after_provider_failure_preserves_completed_steps(tmp_path):
-    stopped = cli(tmp_path, 'start', 'recover', '--repo', str(EXAMPLE / 'repo'),
+    stopped = cli(tmp_path, 'start', 'recover', '--repo', str(EXAMPLE),
                   '--issue', 'Fix pagination.', model='failing_model')
     assert stopped.returncode == 1
     assert 'Simulated provider interruption' in stopped.stderr
@@ -112,8 +144,33 @@ def test_resume_after_provider_failure_preserves_completed_steps(tmp_path):
     assert results == ['run_tests', 'search_repo', 'read_file']
 
 
+def test_generated_ids_keep_tasks_separate_and_allow_resume(tmp_path):
+    first = cli(tmp_path, 'start', '--repo', str(EXAMPLE), '--issue', 'First task',
+                model='failing_model')
+    assert first.returncode == 1, first.stderr
+    first_id = first.stdout.splitlines()[0].removeprefix('Run ID: ')
+    assert UUID(first_id).version == 4
+
+    second = cli(tmp_path, 'start', '--repo', str(EXAMPLE), '--issue', 'Second task')
+    assert second.returncode == 0, second.stderr
+    second_id = second.stdout.splitlines()[0].removeprefix('Run ID: ')
+    assert UUID(second_id).version == 4
+    assert first_id != second_id
+
+    duplicate = cli(tmp_path, 'start', second_id, '--repo', str(EXAMPLE), '--issue', 'Duplicate task')
+    assert duplicate.returncode == 1
+    assert 'Run ID already exists' in duplicate.stderr
+
+    resumed = cli(tmp_path, 'resume', first_id)
+    assert resumed.returncode == 0, resumed.stderr
+    assert 'Issue: First task' in resumed.stdout
+    assert 'Approval required' in resumed.stdout
+    assert trace(tmp_path, first_id)[0]['message'] == 'First task'
+    assert trace(tmp_path, second_id)[0]['message'] == 'Second task'
+
+
 def test_step_limit_ends_before_another_model_call(tmp_path):
-    result = cli(tmp_path, 'start', 'limited', '--repo', str(EXAMPLE / 'repo'),
+    result = cli(tmp_path, 'start', 'limited', '--repo', str(EXAMPLE),
                  '--issue', 'Fix pagination.', '--max-steps', '1', model='failing_model')
     assert result.returncode == 0, result.stderr
     assert 'Stopped: step_limit' in result.stdout
