@@ -1,0 +1,6 @@
+langgraph
+langgraph-checkpoint-sqlite
+pytest
+dotenv
+langchain
+langchain-openai
