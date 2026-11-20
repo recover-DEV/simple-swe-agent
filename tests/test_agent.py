@@ -128,6 +128,10 @@ def test_approval_survives_process_exit(tmp_path, decision, mode):
         assert rows[-1]['steps'] == 4
     expected_original = NEW if mode == 'in-place' and decision == '--approve' else OLD
     assert expected_original in (original / 'pagination.py').read_text(encoding='utf-8')
+    conversation = (run_directory / 'conversation.md').read_text(encoding='utf-8')
+    assert f'实际工作目录：`{working_file.parent}`' in conversation
+    if decision == '--approve':
+        assert f'+    {NEW}' in conversation
 
 
 def test_resume_after_provider_failure_preserves_completed_steps(tmp_path):
@@ -149,12 +153,14 @@ def test_generated_ids_keep_tasks_separate_and_allow_resume(tmp_path):
                 model='failing_model')
     assert first.returncode == 1, first.stderr
     first_id = first.stdout.splitlines()[0].removeprefix('Run ID: ')
-    assert UUID(first_id).version == 4
+    assert first_id.startswith('pagination-')
+    assert UUID(first_id.rsplit('-', 1)[-1]).version == 4
 
     second = cli(tmp_path, 'start', '--repo', str(EXAMPLE), '--issue', 'Second task')
     assert second.returncode == 0, second.stderr
     second_id = second.stdout.splitlines()[0].removeprefix('Run ID: ')
-    assert UUID(second_id).version == 4
+    assert second_id.startswith('pagination-')
+    assert UUID(second_id.rsplit('-', 1)[-1]).version == 4
     assert first_id != second_id
 
     duplicate = cli(tmp_path, 'start', second_id, '--repo', str(EXAMPLE), '--issue', 'Duplicate task')
@@ -167,6 +173,27 @@ def test_generated_ids_keep_tasks_separate_and_allow_resume(tmp_path):
     assert 'Approval required' in resumed.stdout
     assert trace(tmp_path, first_id)[0]['message'] == 'First task'
     assert trace(tmp_path, second_id)[0]['message'] == 'Second task'
+    index = (tmp_path / 'runs' / 'INDEX.md').read_text(encoding='utf-8')
+    for title, run_id in [('First task', first_id), ('Second task', second_id)]:
+        row = next(line for line in index.splitlines() if line.startswith(f'| {title} |'))
+        assert f'[{run_id}]({run_id}/conversation.md)' in row
+        assert f'runs/{run_id}/repo' in row
+
+
+def test_history_backfills_existing_run_without_inventing_original_repository(tmp_path):
+    existing = tmp_path / 'runs' / 'old-id'
+    (existing / 'repo').mkdir(parents=True)
+    logs = tmp_path / 'results' / 'logs'
+    logs.mkdir(parents=True)
+    log = logs / 'old-id.jsonl'
+    log.write_text('{"event":"issue","message":"Old task"}\n', encoding='utf-8')
+
+    result = cli(tmp_path, 'history')
+    assert result.returncode == 0, result.stderr
+    index = (tmp_path / 'runs' / 'INDEX.md').read_text(encoding='utf-8')
+    assert '| Old task | 未记录 | [runs/old-id/repo](old-id/repo/) | 副本 |' in index
+    assert (existing / 'conversation.md').is_file()
+    assert log.read_text(encoding='utf-8') == '{"event":"issue","message":"Old task"}\n'
 
 
 def test_step_limit_ends_before_another_model_call(tmp_path):
