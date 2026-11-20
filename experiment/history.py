@@ -17,6 +17,7 @@ class RunHistory:
     source: Path | None
     workspace: Path | None
     mode: str
+    strategy: str
     rows: list[dict]
     log_updated: float
 
@@ -34,8 +35,11 @@ class RunHistory:
             label = '等待审批'
         else:
             reason = status.get('stop_reason')
-            label = {'model_finished': '已结束', 'step_limit': '达到步数上限',
-                     'invalid_tool_call': '工具请求无效'}.get(reason, '可恢复' if status.get('next') else '待记录')
+            labels = {'model_finished': '已结束', 'step_limit': '达到步数上限', 'invalid_tool_call': '工具请求无效',
+                      'tests_passed': '测试通过', 'tests_failed': '测试失败', 'tests_unavailable': '测试无法运行',
+                      'edit_rejected': '编辑已拒绝', 'edit_failed': '编辑失败', 'read_failed': '读取失败',
+                      'source_not_found': '未找到源码'}
+            label = labels.get(reason, '可恢复' if status.get('next') else '待记录')
         code = status.get('last_test_exit_code')
         return f'{label} · pytest {code}' if code is not None else label
 
@@ -49,7 +53,7 @@ def read_history(directory: Path, log: Path) -> RunHistory:
     workspace = source if mode == 'in-place' else copy if mode == 'copy' else None
     rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines() if line.strip()] if log.is_file() else []
     updated = log.stat().st_mtime if rows else directory.stat().st_mtime
-    return RunHistory(directory, source, workspace, mode, rows, updated)
+    return RunHistory(directory, source, workspace, mode, target.get('strategy', 'agent'), rows, updated)
 
 
 def table_text(value: str) -> str:
@@ -72,7 +76,8 @@ def transcript(record: RunHistory) -> str:
     modes = {'in-place': '直接修复', 'copy': '副本'}
     lines = [f'# {record.title}', '', f'- 运行 ID：`{record.directory.name}`',
              f'- 原仓库：`{record.source or "未记录"}`', f'- 实际工作目录：`{record.workspace or "未记录"}`',
-             f'- 模式：{modes.get(record.mode, "未记录")}', f'- 状态：{record.status}', '']
+             f'- 模式：{modes.get(record.mode, "未记录")}', f'- 策略：`{record.strategy}`',
+             f'- 状态：{record.status}', '']
     for row in record.rows:
         event = row['event']
         if event == 'issue':
@@ -117,8 +122,8 @@ def refresh_history(project: Path, updated_run: str | None = None) -> Path:
             if log.is_file() or (directory / 'target.json').is_file() or (directory / 'checkpoint.sqlite3').is_file():
                 records.append(read_history(directory, log))
         lines = ['# Agent 任务索引', '', '实际工作目录是 Agent 读取、修改和测试代码的位置。', '',
-                 '| 题目 | 原仓库 | 实际工作目录 | 模式 | 状态 | 对话 |',
-                 '|---|---|---|---|---|---|']
+                 '| 题目 | 原仓库 | 实际工作目录 | 模式 | 策略 | 状态 | 对话 |',
+                 '|---|---|---|---|---|---|---|']
         for record in sorted(records, key=lambda item: item.log_updated, reverse=True):
             history = record.directory / 'conversation.md'
             if updated_run is None or updated_run == record.directory.name or not history.is_file():
@@ -127,6 +132,7 @@ def refresh_history(project: Path, updated_run: str | None = None) -> Path:
             workspace = directory_link(record.workspace, project, runs)
             mode = {'in-place': '直接修复', 'copy': '副本'}.get(record.mode, '未记录')
             link = f'[{table_text(record.directory.name)}]({quote(record.directory.name)}/conversation.md)'
-            lines.append(f'| {table_text(record.title)} | {source} | {workspace} | {mode} | {record.status} | {link} |')
+            lines.append(f'| {table_text(record.title)} | {source} | {workspace} | {mode} | '
+                         f'{record.strategy} | {record.status} | {link} |')
         atomic_write(index, ('\n'.join(lines) + '\n').encode('utf-8'))
     return index

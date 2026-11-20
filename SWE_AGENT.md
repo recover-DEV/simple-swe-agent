@@ -36,13 +36,26 @@ $runId = '粘贴程序打印的 Run ID'
 
 默认上限是 12 次工具调用，可用 `start ... --max-steps 12` 设置。失败或被拒绝的调用也占一步。`model_finished` 表示模型结束，`step_limit` 表示达到上限。核对是否修复时看 **最后一次源码修改后的 pytest 退出码**，`0` 表示测试通过。如果修改后还未跑测试，状态会显示结果未确认。
 
-打开 [任务索引](runs/INDEX.md) 可以按题目找到原仓库、实际工作目录、运行模式和状态。每行最右侧链接会打开该任务的 Markdown 对话记录。日志导出时会更新索引。也可以运行 `run_agent.py history` 为已有任务重新生成索引和记录。
+打开 [任务索引](runs/INDEX.md) 可以按题目找到原仓库、实际工作目录、运行模式、策略和状态。每行最右侧链接会打开该任务的 Markdown 对话记录。日志导出时会更新索引。也可以运行 `run_agent.py history` 为已有任务重新生成索引和记录。
+
+## 用固定 Workflow 跑同一道题
+
+在 `start` 加上 `--strategy workflow`，使用副本完成一次可对照的运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\run_agent.py start --strategy workflow --copy --repo .\examples\pagination --issue-file .\examples\pagination\issue.md
+```
+
+Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取该测试文件，再根据题目提到的文件名、失败堆栈和该用例引用的模块选择并读取源码。模型会收到测试内容、源码和最新测试结果。写入经过审批的修改后，Workflow 会重跑 pytest。如果仍有失败，Workflow 会根据新的结果重新定位源码，再申请一次修改和复验。CLI 的 `status` 和 `resume --approve` 与 Agent 用法相同，恢复时会从任务记录加载原来的策略。
+
+对照 Agent 时，用同一条命令，把 `--strategy workflow` 改成 `--strategy agent`。命令会创建独立副本，两版默认最多调用 12 次工具。索引和 JSONL 日志会记录策略、调用步骤和最终结果。Workflow 显示 `tests_passed` 时，最后一次 pytest 已通过。
 
 | 文件或目录 | 用途 |
 |---|---|
 | `run_agent.py` | 命令行入口，处理 `start`、`status`、`resume` 和 `history`。 |
 | `experiment/__init__.py` | 声明 Python 包。 |
 | `experiment/agent.py` | 定义 LangGraph 状态、工具循环和审批节点。 |
+| `experiment/workflow.py` | 定义固定步骤、源码定位规则和一次返修分支。 |
 | `experiment/aci.py` | 定义模型可调用的本地仓库工具和执行逻辑。 |
 | `experiment/model.py` | 将项目模型配置接到 LangGraph，向模型声明工具。 |
 | `experiment/history.py` | 将本地运行记录整理成索引和可读的 Markdown。 |
@@ -54,7 +67,7 @@ $runId = '粘贴程序打印的 Run ID'
 | `requirements.in`、`requirements.txt` | 分别保存直接依赖和固定版本，含 SQLite checkpoint 组件。 |
 | `.gitignore`、`.env` | 忽略本地运行副本和密钥文件，模型配置保存在已有的 `.env`。 |
 | `runs/<ID>/repo/` | 副本模式下可修改和测试的仓库副本。 |
-| `runs/<ID>/target.json` | 保存所选模式和原仓库的路径，供恢复时使用。 |
+| `runs/<ID>/target.json` | 保存策略、写入模式和原仓库的路径，供恢复时使用。 |
 | `runs/INDEX.md`、`runs/<ID>/conversation.md` | 任务总览和单次任务的对话记录。 |
 | `runs/<ID>/checkpoint.sqlite3`、`invocation.lock` | 保存图状态，确保同一个运行 ID 的执行串行。 |
 | `runs/.repository-locks/` | 协调同一个原仓库上的直接修复和复制操作。 |
@@ -74,7 +87,7 @@ $runId = '粘贴程序打印的 Run ID'
 | `exclusive_lock` | 在命令执行期间持有 SQLite 独占锁。 |
 | `repository_lock` | 按原仓库路径选择共享锁，避免两个任务交错写入。 |
 | `start_run` | 验证输入、建立运行目录，按所选模式复制仓库或登记原路径。 |
-| `run_repository` | 读取运行的目标位置和模式，支持早期的副本存档。 |
+| `run_repository` | 读取运行的目标位置、模式和策略，支持早期的 Agent 存档。 |
 | `resume_input` | 检查是否有待执行节点，按需把人工决定放入 `Command(resume=...)`。 |
 | `write_trace` | 从当前 checkpoint 重建 JSONL 日志，再更新任务索引和对话记录。 |
 | `show_status` | 显示题目首行、写入目标、待审批 diff、调用次数和测试退出码。 |
@@ -88,6 +101,8 @@ $runId = '粘贴程序打印的 Run ID'
 | 函数 | 作用 |
 |---|---|
 | `last_model_message`、`active_call` | 找到最近的模型消息及这条消息中当前要处理的工具调用。 |
+| `prepare_replacement` | 校验精确文本替换，生成待审批的文件差异。 |
+| `run_tool`、`record_tool_result` | 执行共用工具，记录返回结果、调用次数和 pytest 状态。 |
 | `after_model` | 根据模型是否结束，进入工具阶段或退出。 |
 | `after_prepare` | 有有效的待写入 diff 就进入审批，其余动作直接交给执行节点。 |
 | `after_action` | 处理同一批剩余的工具调用，或者把结果交回模型。 |
@@ -99,6 +114,19 @@ $runId = '粘贴程序打印的 Run ID'
 
 审批和写入是独立节点。SQLite 保存了写入前的审批决定，恢复时仍使用该决定。若进程在写入完成后、结果保存前退出，下一次执行会检查文件内容是否已是批准后的版本。[LangGraph 检查点文档](https://docs.langchain.com/oss/python/langgraph/persistence) · [LangGraph 审批文档](https://docs.langchain.com/oss/python/langgraph/interrupts)
 
+### `experiment/workflow.py`
+
+| 函数 | 作用 |
+|---|---|
+| `select_source`、内部 `score` | 从搜索结果中选一个源码文件，优先匹配题目和测试输出。 |
+| `after_tests`、`after_proposal` | 按固定条件选择结束、读源码、审批或记录无效修改。 |
+| `build_workflow` | 编译固定步骤和一次返修分支。 |
+| `run_fixed_tool`、`check_budget` | 发起由流程指定的工具调用并检查步数上限。 |
+| `run_tests` | 执行基线测试或复验，决定是否需要返修。 |
+| `read_test`、`search_source`、`read_source` | 读取失败测试，定位并读取供模型修改的源码。 |
+| `propose_patch` | 把题目、源码和最新 pytest 反馈交给模型，验证生成的修改。 |
+| `apply_patch` | 处理审批结果并记录写入，成功后转到 pytest。 |
+
 ### `experiment/aci.py`
 
 `RepositoryACI` 将工具限制在本次选定的仓库目录。四个模型工具名是 `search_repo`、`read_file`、`replace_text` 和 `run_tests`。编辑采用精确文本替换，现有测试文件可供读取和搜索。
@@ -106,20 +134,21 @@ $runId = '粘贴程序打印的 Run ID'
 | 函数或方法 | 作用 |
 |---|---|
 | `atomic_write` | 用同目录的临时文件完成整文件替换，用于写源码和 JSONL 日志。 |
+| `is_test_path` | 识别测试文件，供源码定位和写入校验共用。 |
 | `RepositoryACI.__init__` | 解析仓库根目录并设置测试超时。 |
 | `source_path` | 解析现有 Python 文件的相对路径，检查范围和大小。 |
 | `search_repo` | 按关键词搜索 Python 文件路径或代码行，返回带位置的匹配。 |
 | `read_file` | 读取指定行范围，返回带行号的内容。 |
 | `prepare_edit` | 验证唯一匹配的旧文本，生成 `PreparedEdit`，包含 diff、更新内容和前后文件校验值。模型看到的工具名是 `replace_text`。 |
 | `apply_edit` | 核对文件与审批时的版本一致后写入。已经写入同一份内容时，返回已应用。 |
-| `run_tests` | 在所选仓库目录执行 `python -m pytest`，返回退出码、输出或超时结果。测试在本机执行，示例或目标仓库应来自可信来源。 |
+| `run_tests` | 在所选仓库目录运行 pytest，将 `test.py` 加入仓库现有的测试文件匹配规则，返回退出码、输出或超时结果。测试在本机执行，示例或目标仓库应来自可信来源。 |
 | `model_tools` | 向模型提供四个工具的名称、说明和参数结构。 |
 
 ### 其他 Python 文件
 
 | 文件 | 函数及作用 |
 |---|---|
-| `experiment/model.py` | `create_model` 创建模型适配器。内部 `invoke` 首次调用时读取模型配置、绑定工具，后续调用复用模型客户端。连接 DeepSeek 官方地址时使用非思考模式，以兼容 Chat Completions 工具循环。[DeepSeek 模式说明](https://api-docs.deepseek.com/guides/thinking_mode/) |
+| `experiment/model.py` | `create_model` 创建模型适配器。内部 `invoke` 首次调用时读取模型配置、绑定工具，后续调用复用模型客户端。Workflow 的模型阶段只绑定 `replace_text`。连接 DeepSeek 官方地址时使用非思考模式，以兼容 Chat Completions 工具循环。[DeepSeek 模式说明](https://api-docs.deepseek.com/guides/thinking_mode/) |
 | `experiment/history.py` | `read_history` 读取单次运行的目录和日志，`RunHistory.title` 与 `RunHistory.status` 提取摘要。`table_text` 转义表格文字，`directory_link` 生成目录链接。`transcript` 渲染对话，`refresh_history` 更新各次记录和索引。 |
 | `examples/pagination/pagination.py` | `paginate` 校验页码和每页数量后返回切片。示例原件将 1 起始的页码直接用于偏移量计算。 |
 | `examples/pagination/test_pagination.py` | `test_first_page`、`test_second_page` 核对切片，`test_invalid_page` 核对无效页码仍抛出异常。 |
@@ -127,6 +156,7 @@ $runId = '粘贴程序打印的 Run ID'
 | `tests/test_agent.py` | `test_choose_mode_prompts_in_terminal` 验证启动询问。`test_approval_survives_process_exit` 验证两种模式下的批准、拒绝和恢复。`test_resume_after_provider_failure_preserves_completed_steps` 验证中断后续跑。`test_step_limit_ends_before_another_model_call` 核对工具预算。`test_aci_checks_edit_scope_and_replays_approved_write_safely` 检查编辑范围、过期 diff 和重复执行。 |
 | `tests/test_agent.py` | `test_generated_ids_keep_tasks_separate_and_allow_resume` 验证自动编号、拒绝重复编号，以及按原编号恢复各自的任务。 |
 | `tests/test_agent.py` | `test_history_backfills_existing_run_without_inventing_original_repository` 验证旧任务的索引与对话导出。 |
+| `tests/test_agent.py` | `workflow_patch_model` 模拟生成补丁，`test_workflow_executes_fixed_order_and_retries_on_failure` 验证 Workflow 的执行顺序、恢复和一次返修，`test_workflow_obeys_tool_budget` 验证步数上限。 |
 | `tests/test_agent.py` | `test_model_adapter_sends_tool_schemas_and_decodes_tool_calls` 使用模拟 HTTP 响应验证模型适配器。内部 `fake_provider` 检查请求并返回工具调用，`create_local_model` 建立使用该模拟服务的客户端。 |
 
 ## 本地验证

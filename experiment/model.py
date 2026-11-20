@@ -12,7 +12,7 @@ from langchain_openai import ChatOpenAI
 from .aci import RepositoryACI
 
 
-def create_model(aci: RepositoryACI, env_file: Path) -> Callable[[list[BaseMessage]], AIMessage]:
+def create_model(aci: RepositoryACI, env_file: Path, *, edit_only: bool = False) -> Callable[[list[BaseMessage]], AIMessage]:
     """Bind ACI tools on first use, keeping status and checkpoint inspection local."""
     bound = None
 
@@ -31,7 +31,10 @@ def create_model(aci: RepositoryACI, env_file: Path) -> Callable[[list[BaseMessa
             client = ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url,
                                 temperature=0, timeout=45, max_retries=1, use_responses_api=False,
                                 extra_body=extra_body)
-            bound = client.bind_tools(aci.model_tools())
+            tools = aci.model_tools()
+            if edit_only:
+                tools = [tool for tool in tools if tool.name == 'replace_text']
+            bound = client.bind_tools(tools)
         response = bound.invoke(messages)
         if not isinstance(response, AIMessage):
             raise TypeError('Expected an AIMessage from the configured chat model.')

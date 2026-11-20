@@ -14,6 +14,23 @@ from langchain_core.tools import StructuredTool
 MAX_SOURCE_BYTES = 128_000
 MAX_OUTPUT = 8_000
 
+PYTEST_RUNNER = '''import sys
+import pytest
+
+class TestDiscovery:
+    def pytest_configure(self, config):
+        config.addinivalue_line('python_files', 'test.py')
+
+raise SystemExit(pytest.main(sys.argv[1:], plugins=[TestDiscovery()]))
+'''
+
+
+def is_test_path(path: Path) -> bool:
+    parts = tuple(part.casefold() for part in path.parts)
+    name = parts[-1]
+    return (bool({'test', 'tests'}.intersection(parts[:-1])) or name.startswith('test_')
+            or name.endswith('_test.py') or name in {'test.py', 'conftest.py'})
+
 
 class PreparedEdit(TypedDict):
     path: str
@@ -87,9 +104,7 @@ class RepositoryACI:
     def prepare_edit(self, path: str, old: str, new: str) -> PreparedEdit:
         source = self.source_path(path)
         relative = source.relative_to(self.root)
-        parts = tuple(part.casefold() for part in relative.parts)
-        name = parts[-1]
-        if {'test', 'tests'}.intersection(parts[:-1]) or name.startswith('test_') or name.endswith('_test.py') or name == 'conftest.py':
+        if is_test_path(relative):
             raise ValueError('Test files are read-only.')
         before = source.read_bytes()
         text = before.decode('utf-8')
@@ -121,7 +136,7 @@ class RepositoryACI:
         return {'ok': True, 'path': edit['path'], 'diff': edit['diff']}
 
     def run_tests(self) -> dict:
-        command = [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider']
+        command = [sys.executable, '-c', PYTEST_RUNNER, '-q', '-p', 'no:cacheprovider']
         allowed = {'SYSTEMROOT', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'TMPDIR', 'SYSTEMDRIVE'}
         env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
         env.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1')
@@ -131,8 +146,12 @@ class RepositoryACI:
                                     timeout=self.timeout, check=False)
         except subprocess.TimeoutExpired:
             return {'ok': False, 'exit_code': None, 'error': f'pytest exceeded {self.timeout} seconds.'}
-        return {'ok': result.returncode == 0, 'exit_code': result.returncode,
-                'output': result.stdout[-MAX_OUTPUT:]}
+        feedback = {'ok': result.returncode == 0, 'exit_code': result.returncode,
+                    'output': result.stdout[-MAX_OUTPUT:]}
+        if result.returncode == 5:
+            feedback['error'] = ('Pytest collected no tests. Check the test file and function names '
+                                 'and the repository pytest configuration.')
+        return feedback
 
     def model_tools(self) -> list[StructuredTool]:
         """Describe the ACI operations for native model tool calling."""

@@ -21,16 +21,19 @@ from experiment.aci import RepositoryACI, atomic_write
 from experiment.agent import build_agent
 from experiment.history import refresh_history
 from experiment.model import create_model
+from experiment.workflow import build_workflow
 
 PROJECT = Path(__file__).resolve().parent
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Repair a local Python repository with a LangGraph agent.')
+    parser = argparse.ArgumentParser(description='Repair a local Python repository with LangGraph.')
     commands = parser.add_subparsers(dest='command', required=True)
     start = commands.add_parser('start', help='Start a repair in a copy or in the original repository.')
     start.add_argument('run_id', nargs='?', help='Optional ID. Defaults to the repository name plus a UUID.')
     start.add_argument('--repo', type=Path, required=True)
+    start.add_argument('--strategy', choices=('agent', 'workflow'), default='agent',
+                       help='Choose the model-driven agent or the fixed workflow.')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--copy', dest='mode', action='store_const', const='copy',
                       help='Work on a copy of the repository.')
@@ -106,23 +109,26 @@ def start_run(args: argparse.Namespace, directory: Path, source: Path, mode: str
             raise ValueError(f'Run ID already exists: {directory.name}. Use a different ID or omit it.') from error
         if mode == 'copy':
             shutil.copytree(source, directory / 'repo', ignore=ignore_copy)
-        target = {'mode': mode, 'source': str(source)}
+        target = {'mode': mode, 'source': str(source), 'strategy': args.strategy}
         atomic_write(directory / 'target.json', json.dumps(target, ensure_ascii=False).encode('utf-8'))
     return {'messages': [('human', issue)], 'steps': 0, 'max_steps': args.max_steps}
 
 
-def run_repository(directory: Path) -> tuple[Path, str]:
+def run_repository(directory: Path) -> tuple[Path, str, str]:
     metadata = directory / 'target.json'
     if not metadata.is_file():
-        return (directory / 'repo').resolve(strict=True), 'copy'
+        return (directory / 'repo').resolve(strict=True), 'copy', 'agent'
     target = json.loads(metadata.read_text(encoding='utf-8'))
+    strategy = target.get('strategy', 'agent')
+    if strategy not in ('agent', 'workflow'):
+        raise ValueError('Unrecognized strategy in target.json.')
     if target['mode'] == 'copy':
-        return (directory / 'repo').resolve(strict=True), 'copy'
+        return (directory / 'repo').resolve(strict=True), 'copy', strategy
     if target['mode'] == 'in-place':
         source = Path(target['source'])
         if source != source.resolve(strict=True):
             raise ValueError('The original repository path has changed. Start a new run.')
-        return source, 'in-place'
+        return source, 'in-place', strategy
     raise ValueError('Unrecognized repository mode in target.json.')
 
 
@@ -138,7 +144,7 @@ def resume_input(args: argparse.Namespace, snapshot: StateSnapshot) -> Command |
     return None
 
 
-def write_trace(snapshot: StateSnapshot, path: Path) -> None:
+def write_trace(snapshot: StateSnapshot, path: Path, strategy: str) -> None:
     rows = []
     step = 0
     for message in snapshot.values['messages']:
@@ -152,7 +158,7 @@ def write_trace(snapshot: StateSnapshot, path: Path) -> None:
                          'call_id': message.tool_call_id, 'result': json.loads(message.content)})
     for pending in snapshot.interrupts:
         rows.append({'event': 'approval_pending', 'request': pending.value})
-    rows.append({'event': 'status', 'steps': snapshot.values['steps'], 'next': snapshot.next,
+    rows.append({'event': 'status', 'strategy': strategy, 'steps': snapshot.values['steps'], 'next': snapshot.next,
                  'stop_reason': snapshot.values.get('stop_reason'),
                  'last_test_exit_code': snapshot.values.get('last_test_exit_code')})
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,11 +170,12 @@ def write_trace(snapshot: StateSnapshot, path: Path) -> None:
         print(f'Could not refresh the Markdown history: {error}', file=sys.stderr)
 
 
-def show_status(snapshot: StateSnapshot, directory: Path, repository: Path, mode: str) -> None:
+def show_status(snapshot: StateSnapshot, directory: Path, repository: Path, mode: str, strategy: str) -> None:
     state = snapshot.values
     print(f'Run: {directory.name} | Tool calls: {state["steps"]}/{state["max_steps"]}')
     issue = str(state['messages'][0].content).strip().splitlines()[0]
     print(f'Issue: {issue}')
+    print(f'Strategy: {strategy}')
     print(f'Repository: {repository} ({mode})')
     for pending in snapshot.interrupts:
         print('Approval required. Review the diff and resume with --approve or --reject.')
@@ -206,12 +213,14 @@ def run_command(args: argparse.Namespace) -> None:
         elif not database.is_file():
             raise ValueError(f'No checkpoint for {run_id}.')
         contexts.enter_context(exclusive_lock(directory / 'invocation.lock'))
-        repository, mode = run_repository(directory)
+        repository, mode, strategy = run_repository(directory)
         if mode == 'in-place' and args.command == 'resume':
             contexts.enter_context(repository_lock(repository))
         checkpointer = contexts.enter_context(SqliteSaver.from_conn_string(str(database)))
         aci = RepositoryACI(repository)
-        graph = build_agent(aci, create_model(aci, PROJECT / '.env'), checkpointer)
+        build_graph = build_workflow if strategy == 'workflow' else build_agent
+        model = create_model(aci, PROJECT / '.env', edit_only=strategy == 'workflow')
+        graph = build_graph(aci, model, checkpointer)
         config = {'configurable': {'thread_id': run_id}}
         log_path = PROJECT / 'results' / 'logs' / f'{run_id}.jsonl'
         snapshot = graph.get_state(config)
@@ -224,12 +233,12 @@ def run_command(args: argparse.Namespace) -> None:
             finally:
                 snapshot = graph.get_state(config)
                 if snapshot.values:
-                    write_trace(snapshot, log_path)
+                    write_trace(snapshot, log_path, strategy)
         if not snapshot.values:
             raise ValueError(f'No saved graph state for {run_id}.')
         if args.command == 'status':
-            write_trace(snapshot, log_path)
-        show_status(snapshot, directory, repository, mode)
+            write_trace(snapshot, log_path, strategy)
+        show_status(snapshot, directory, repository, mode, strategy)
 
 
 def main(argv: list[str] | None = None) -> int:

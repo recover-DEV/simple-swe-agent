@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / 'examples' / 'pagination'
 OLD = 'start = page * page_size'
 NEW = 'start = (page - 1) * page_size'
+WRONG = 'start = (page + 1) * page_size'
 
 DRIVER = '''
 import runpy
@@ -28,7 +29,7 @@ import run_agent
 
 fixture = runpy.run_path(sys.argv[1])
 run_agent.PROJECT = Path(sys.argv[2])
-run_agent.create_model = lambda aci, env_file: fixture[sys.argv[3]]
+run_agent.create_model = lambda aci, env_file, **options: fixture[sys.argv[3]]
 raise SystemExit(run_agent.main(sys.argv[4:]))
 '''
 
@@ -62,6 +63,28 @@ def failing_model(messages):
     if any(isinstance(message, ToolMessage) for message in messages):
         raise ValueError('Simulated provider interruption')
     return scripted_model(messages)
+
+
+def workflow_patch_model(messages):
+    context = json.loads(messages[-1].content)
+    source = context['numbered_source']
+    assert context['pytest']['exit_code'] == 1
+    assert 'test_first_page' in context['pytest']['output']
+    if WRONG in source:
+        return request_tool('replace_text', 2, path=context['path'], old=WRONG, new=NEW)
+    assert OLD in source
+    proposed = WRONG if context['issue'] == 'Try a second patch' else NEW
+    return request_tool('replace_text', 1, path=context['path'], old=OLD, new=proposed)
+
+
+def workflow_two_source_model(messages):
+    context = json.loads(messages[-1].content)
+    output = context['pytest']['output']
+    path = 'z_worker.py' if 'FAILED test.py::test_first' in output else 'a_worker.py'
+    assert context['path'] == path
+    assert context['test_path'] == 'test.py'
+    assert 'from z_worker import compute as first' in context['numbered_test']
+    return request_tool('replace_text', 1, path=path, old='return 0', new='return 1')
 
 
 def cli(workspace, *args, model='scripted_model'):
@@ -204,16 +227,90 @@ def test_step_limit_ends_before_another_model_call(tmp_path):
     assert trace(tmp_path, 'limited')[-1]['steps'] == 1
 
 
+@pytest.mark.parametrize('retry', [False, True])
+def test_workflow_executes_fixed_order_and_retries_on_failure(tmp_path, retry):
+    issue = 'Try a second patch' if retry else 'Fix pagination'
+    started = cli(tmp_path, 'start', 'fixed', '--strategy', 'workflow', '--copy', '--repo', str(EXAMPLE),
+                  '--issue', issue, model='workflow_patch_model')
+    assert started.returncode == 0, started.stderr
+    assert 'Approval required' in started.stdout
+    assert 'Strategy: workflow' in started.stdout
+    work_file = tmp_path / 'runs' / 'fixed' / 'repo' / 'pagination.py'
+    assert OLD in work_file.read_text(encoding='utf-8')
+
+    result = cli(tmp_path, 'resume', 'fixed', '--approve', model='workflow_patch_model')
+    assert result.returncode == 0, result.stderr
+    if retry:
+        assert 'Approval required' in result.stdout
+        assert WRONG in work_file.read_text(encoding='utf-8')
+        result = cli(tmp_path, 'resume', 'fixed', '--approve', model='workflow_patch_model')
+        assert result.returncode == 0, result.stderr
+
+    assert 'Stopped: tests_passed' in result.stdout
+    assert NEW in work_file.read_text(encoding='utf-8')
+    rows = trace(tmp_path, 'fixed')
+    actions = [row for row in rows if row['event'] == 'tool_result']
+    expected = ['run_tests', 'read_file', 'search_repo', 'read_file', 'replace_text', 'run_tests']
+    if retry:
+        expected += ['read_file', 'search_repo', 'read_file', 'replace_text', 'run_tests']
+    assert [row['tool'] for row in actions] == expected
+    assert [row['result']['exit_code'] for row in actions if row['tool'] == 'run_tests'] == ([1, 1, 0] if retry else [1, 0])
+    assert rows[-1]['steps'] == len(expected)
+    assert rows[-1]['strategy'] == 'workflow'
+
+
+def test_workflow_uses_test_py_to_find_each_failing_source(tmp_path):
+    repository = tmp_path / 'input'
+    repository.mkdir()
+    for name in ('a_worker.py', 'z_worker.py'):
+        (repository / name).write_text('def compute():\n    return 0\n', encoding='utf-8')
+    (repository / 'pytest.ini').write_text('[pytest]\npython_files = check_*.py\n', encoding='utf-8')
+    (repository / 'check_existing.py').write_text('def test_existing():\n    assert True\n', encoding='utf-8')
+    (repository / 'test.py').write_text(
+        'from z_worker import compute as first\n'
+        'from a_worker import compute as second\n\n'
+        'def test_first():\n    assert first() == 1\n\n'
+        'def test_second():\n    assert second() == 1\n',
+        encoding='utf-8',
+    )
+    model = 'workflow_two_source_model'
+    started = cli(tmp_path, 'start', 'two-source', '--strategy', 'workflow', '--copy', '--repo', str(repository),
+                  '--issue', 'Fix both failed tests', model=model)
+    assert started.returncode == 0, started.stderr
+    assert 'Approval required' in started.stdout
+    retried = cli(tmp_path, 'resume', 'two-source', '--approve', model=model)
+    assert retried.returncode == 0, retried.stderr
+    assert 'Approval required' in retried.stdout
+    finished = cli(tmp_path, 'resume', 'two-source', '--approve', model=model)
+    assert finished.returncode == 0, finished.stderr
+    assert 'Stopped: tests_passed' in finished.stdout
+    actions = [row for row in trace(tmp_path, 'two-source') if row['event'] == 'tool_result']
+    assert [row['result']['path'] for row in actions if row['tool'] == 'read_file'] == [
+        'test.py', 'z_worker.py', 'test.py', 'a_worker.py',
+    ]
+    assert '3 passed' in actions[-1]['result']['output']
+
+
+def test_workflow_obeys_tool_budget(tmp_path):
+    result = cli(tmp_path, 'start', 'limited', '--strategy', 'workflow', '--repo', str(EXAMPLE),
+                 '--issue', 'Fix pagination', '--max-steps', '2', model='workflow_patch_model')
+    assert result.returncode == 0, result.stderr
+    assert 'Stopped: step_limit' in result.stdout
+    assert trace(tmp_path, 'limited')[-1]['steps'] == 2
+
+
 def test_aci_checks_edit_scope_and_replays_approved_write_safely(tmp_path):
     source = tmp_path / 'worker.py'
     source.write_text('old = 1\n', encoding='utf-8')
-    tests = tmp_path / 'test_worker.py'
-    tests.write_text('old = 1\n', encoding='utf-8')
+    for name in ('test_worker.py', 'test.py'):
+        (tmp_path / name).write_text('old = 1\n', encoding='utf-8')
     aci = RepositoryACI(tmp_path)
     with pytest.raises(ValueError, match='relative'):
         aci.read_file('../outside.py')
     with pytest.raises(ValueError, match='read-only'):
         aci.prepare_edit('test_worker.py', 'old', 'new')
+    with pytest.raises(ValueError, match='read-only'):
+        aci.prepare_edit('test.py', 'old', 'new')
 
     stale = aci.prepare_edit('worker.py', 'old', 'new')
     source.write_text('old = 2\n', encoding='utf-8')
