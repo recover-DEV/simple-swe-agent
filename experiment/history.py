@@ -10,6 +10,21 @@ from urllib.parse import quote
 
 from .aci import atomic_write
 
+STRATEGIES = ('agent', 'workflow')
+
+
+def run_roots(project: Path) -> dict[str | None, Path]:
+    runs = project / 'runs'
+    # The leading underscore keeps this container distinct from every valid legacy run ID.
+    return {None: runs, **{strategy: runs / '_strategies' / strategy for strategy in STRATEGIES}}
+
+
+def run_log_path(project: Path, directory: Path) -> Path:
+    logs = project / 'results' / 'logs'
+    if directory.parent != project / 'runs':
+        logs /= directory.parent.name
+    return logs / f'{directory.name}.jsonl'
+
 
 @dataclass
 class RunHistory:
@@ -108,19 +123,22 @@ def transcript(record: RunHistory) -> str:
 
 
 def refresh_history(project: Path, updated_run: str | None = None) -> Path:
-    runs = project / 'runs'
+    roots = run_roots(project)
+    runs = roots[None]
     runs.mkdir(parents=True, exist_ok=True)
     index = runs / 'INDEX.md'
-    logs = project / 'results' / 'logs'
     with closing(sqlite3.connect(runs / '.history.lock', timeout=10)) as lock:
         lock.execute('BEGIN EXCLUSIVE')
         records = []
-        for directory in runs.iterdir():
-            if directory.name.startswith('.') or not directory.is_dir():
+        for root in roots.values():
+            if not root.is_dir():
                 continue
-            log = logs / f'{directory.name}.jsonl'
-            if log.is_file() or (directory / 'target.json').is_file() or (directory / 'checkpoint.sqlite3').is_file():
-                records.append(read_history(directory, log))
+            for directory in root.iterdir():
+                if directory.name.startswith('.') or not directory.is_dir():
+                    continue
+                log = run_log_path(project, directory)
+                if log.is_file() or (directory / 'target.json').is_file() or (directory / 'checkpoint.sqlite3').is_file():
+                    records.append(read_history(directory, log))
         lines = ['# Agent 任务索引', '', '实际工作目录是 Agent 读取、修改和测试代码的位置。', '',
                  '| 题目 | 原仓库 | 实际工作目录 | 模式 | 策略 | 状态 | 对话 |',
                  '|---|---|---|---|---|---|---|']
@@ -131,7 +149,8 @@ def refresh_history(project: Path, updated_run: str | None = None) -> Path:
             source = directory_link(record.source, project, runs)
             workspace = directory_link(record.workspace, project, runs)
             mode = {'in-place': '直接修复', 'copy': '副本'}.get(record.mode, '未记录')
-            link = f'[{table_text(record.directory.name)}]({quote(record.directory.name)}/conversation.md)'
+            relative = quote(history.relative_to(runs).as_posix())
+            link = f'[{table_text(record.directory.name)}]({relative})'
             lines.append(f'| {table_text(record.title)} | {source} | {workspace} | {mode} | '
                          f'{record.strategy} | {record.status} | {link} |')
         atomic_write(index, ('\n'.join(lines) + '\n').encode('utf-8'))

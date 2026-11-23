@@ -134,3 +134,16 @@ def build_agent(aci: RepositoryACI, model: Model, checkpointer: BaseCheckpointSa
     graph.add_edge('approve_edit', 'execute_action')
     graph.add_conditional_edges('execute_action', after_action)
     return graph.compile(checkpointer=checkpointer)
+    
+if __name__ == '__main__':
+    from pathlib import Path
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    root = Path(__file__).resolve().parents[1]
+    agent = build_agent(
+        RepositoryACI(root),
+        lambda _: AIMessage(content=''),
+        InMemorySaver(),
+    )
+    print(agent.get_graph().draw_mermaid())

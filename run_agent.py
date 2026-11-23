@@ -19,7 +19,7 @@ from openai import OpenAIError
 
 from experiment.aci import RepositoryACI, atomic_write
 from experiment.agent import build_agent
-from experiment.history import refresh_history
+from experiment.history import STRATEGIES, refresh_history, run_log_path, run_roots
 from experiment.model import create_model
 from experiment.workflow import build_workflow
 
@@ -32,7 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start = commands.add_parser('start', help='Start a repair in a copy or in the original repository.')
     start.add_argument('run_id', nargs='?', help='Optional ID. Defaults to the repository name plus a UUID.')
     start.add_argument('--repo', type=Path, required=True)
-    start.add_argument('--strategy', choices=('agent', 'workflow'), default='agent',
+    start.add_argument('--strategy', choices=STRATEGIES, default='agent',
                        help='Choose the model-driven agent or the fixed workflow.')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--copy', dest='mode', action='store_const', const='copy',
@@ -52,7 +52,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     decision = resume.add_mutually_exclusive_group()
     decision.add_argument('--approve', dest='approved', action='store_const', const=True, default=None)
     decision.add_argument('--reject', dest='approved', action='store_const', const=False)
-    resume.add_argument('--comment', default='')
+    resume.add_argument('--comment', default='',
+                        help='Rejection feedback. In Workflow, a comment requests a revised patch.')
     return parser.parse_args(argv)
 
 
@@ -80,9 +81,9 @@ def generate_run_id(repository: Path) -> str:
 
 
 @contextmanager
-def exclusive_lock(database: Path):
+def exclusive_lock(database: Path, timeout: float = 0):
     """Hold an exclusive SQLite lock until this invocation leaves the context."""
-    with closing(sqlite3.connect(database, timeout=0)) as lock:
+    with closing(sqlite3.connect(database, timeout=timeout)) as lock:
         lock.execute('BEGIN EXCLUSIVE')
         yield
 
@@ -103,15 +104,27 @@ def start_run(args: argparse.Namespace, directory: Path, source: Path, mode: str
     with ExitStack() as locks:
         if mode == 'copy':
             locks.enter_context(repository_lock(source))
-        try:
-            directory.mkdir(parents=True, exist_ok=False)
-        except FileExistsError as error:
-            raise ValueError(f'Run ID already exists: {directory.name}. Use a different ID or omit it.') from error
+        roots = run_roots(PROJECT)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_lock(roots[None] / '.run-ids.lock', timeout=10):
+            if any((root / directory.name).exists() for root in roots.values()):
+                raise ValueError(f'Run ID already exists: {directory.name}. Use a different ID or omit it.')
+            directory.mkdir()
         if mode == 'copy':
             shutil.copytree(source, directory / 'repo', ignore=ignore_copy)
         target = {'mode': mode, 'source': str(source), 'strategy': args.strategy}
         atomic_write(directory / 'target.json', json.dumps(target, ensure_ascii=False).encode('utf-8'))
     return {'messages': [('human', issue)], 'steps': 0, 'max_steps': args.max_steps}
+
+
+def find_run_directory(run_id: str) -> Path:
+    matches = [root / run_id for root in run_roots(PROJECT).values()
+               if (root / run_id / 'checkpoint.sqlite3').is_file()]
+    if not matches:
+        raise ValueError(f'No checkpoint for {run_id}.')
+    if len(matches) > 1:
+        raise ValueError(f'Multiple checkpoints for {run_id}. Run IDs must be unique.')
+    return matches[0]
 
 
 def run_repository(directory: Path) -> tuple[Path, str, str]:
@@ -120,7 +133,7 @@ def run_repository(directory: Path) -> tuple[Path, str, str]:
         return (directory / 'repo').resolve(strict=True), 'copy', 'agent'
     target = json.loads(metadata.read_text(encoding='utf-8'))
     strategy = target.get('strategy', 'agent')
-    if strategy not in ('agent', 'workflow'):
+    if strategy not in STRATEGIES:
         raise ValueError('Unrecognized strategy in target.json.')
     if target['mode'] == 'copy':
         return (directory / 'repo').resolve(strict=True), 'copy', strategy
@@ -179,6 +192,8 @@ def show_status(snapshot: StateSnapshot, directory: Path, repository: Path, mode
     print(f'Repository: {repository} ({mode})')
     for pending in snapshot.interrupts:
         print('Approval required. Review the diff and resume with --approve or --reject.')
+        if strategy == 'workflow':
+            print('Use --reject --comment "Describe the change" to request a revised patch.')
         print(pending.value['diff'])
     if snapshot.next and not snapshot.interrupts:
         print(f'Pending checkpoint: {", ".join(snapshot.next)}')
@@ -199,7 +214,8 @@ def run_command(args: argparse.Namespace) -> None:
     run_id = args.run_id if args.run_id is not None else generate_run_id(source)
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', run_id):
         raise ValueError('Use a run ID with 1–64 ASCII letters, numbers, hyphens or underscores.')
-    directory = PROJECT / 'runs' / run_id
+    directory = (run_roots(PROJECT)[args.strategy] / run_id if args.command == 'start'
+                 else find_run_directory(run_id))
     database = directory / 'checkpoint.sqlite3'
 
     with ExitStack() as contexts:
@@ -210,8 +226,6 @@ def run_command(args: argparse.Namespace) -> None:
                 contexts.enter_context(repository_lock(source))
             initial = start_run(args, directory, source, mode)
             print(f'Run ID: {run_id}', flush=True)
-        elif not database.is_file():
-            raise ValueError(f'No checkpoint for {run_id}.')
         contexts.enter_context(exclusive_lock(directory / 'invocation.lock'))
         repository, mode, strategy = run_repository(directory)
         if mode == 'in-place' and args.command == 'resume':
@@ -222,7 +236,7 @@ def run_command(args: argparse.Namespace) -> None:
         model = create_model(aci, PROJECT / '.env', edit_only=strategy == 'workflow')
         graph = build_graph(aci, model, checkpointer)
         config = {'configurable': {'thread_id': run_id}}
-        log_path = PROJECT / 'results' / 'logs' / f'{run_id}.jsonl'
+        log_path = run_log_path(PROJECT, directory)
         snapshot = graph.get_state(config)
         if args.command == 'start' or args.command == 'resume':
             data = initial if initial is not None else resume_input(args, snapshot)

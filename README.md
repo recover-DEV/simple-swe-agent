@@ -36,7 +36,7 @@ $runId = '粘贴程序打印的 Run ID'
 
 默认上限是 12 次工具调用，可用 `start ... --max-steps 12` 设置。失败或被拒绝的调用也占一步。`model_finished` 表示模型结束，`step_limit` 表示达到上限。核对是否修复时看 **最后一次源码修改后的 pytest 退出码**，`0` 表示测试通过。如果修改后还未跑测试，状态会显示结果未确认。
 
-打开 [任务索引](runs/INDEX.md) 可以按题目找到原仓库、实际工作目录、运行模式、策略和状态。每行最右侧链接会打开该任务的 Markdown 对话记录。日志导出时会更新索引。也可以运行 `run_agent.py history` 为已有任务重新生成索引和记录。
+打开 [任务索引](runs/INDEX.md) 可以按题目找到原仓库、实际工作目录、运行模式、策略和状态。每行最右侧链接会打开该任务的 Markdown 对话记录。新任务按 `agent` 和 `workflow` 分目录保存，旧任务也会出现在同一个索引里。两种布局都可以直接使用运行 ID 查询和恢复。日志导出时会更新索引，也可以运行 `run_agent.py history` 重新生成。
 
 ## 用固定 Workflow 跑同一道题
 
@@ -46,7 +46,9 @@ $runId = '粘贴程序打印的 Run ID'
 .\.venv\Scripts\python.exe .\run_agent.py start --strategy workflow --copy --repo .\examples\pagination --issue-file .\examples\pagination\issue.md
 ```
 
-Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取该测试文件，再根据题目提到的文件名、失败堆栈和该用例引用的模块选择并读取源码。模型会收到测试内容、源码和最新测试结果。写入经过审批的修改后，Workflow 会重跑 pytest。如果仍有失败，Workflow 会根据新的结果重新定位源码，再申请一次修改和复验。CLI 的 `status` 和 `resume --approve` 与 Agent 用法相同，恢复时会从任务记录加载原来的策略。
+Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取该测试文件，再根据题目提到的文件名、失败堆栈和该用例引用的模块选择并读取源码。模型会收到测试内容、源码和最新测试结果，每轮可以为选定的源码文件提交多个 `replace_text` 请求。Workflow 按顺序逐条审批和写入，每条请求单独计步，整轮写入后再运行 pytest。复测失败且还有工具预算时，Workflow 会根据最新结果重新定位源码并继续修复。修复轮数由 `--max-steps` 的工具调用预算约束。测试通过、预算用尽、测试无法运行或编辑失败时，流程按对应状态结束。CLI 的 `status` 和 `resume --approve` 与 Agent 用法相同，恢复时会从任务记录加载原来的策略。
+
+审批时用 `resume $runId --reject --comment '请按这个意见调整补丁'` 可以要求 Workflow 改稿。Workflow 保留已批准的写入，丢弃这批剩余的未审批请求，再把意见、被拒的 diff 和当前源码交给模型。若模型重复提交此前被拒的同一份 diff，Workflow 会拦截它、计一次工具调用，并在预算允许时继续要求改稿。单独使用 `--reject` 会结束任务。
 
 对照 Agent 时，用同一条命令，把 `--strategy workflow` 改成 `--strategy agent`。命令会创建独立副本，两版默认最多调用 12 次工具。索引和 JSONL 日志会记录策略、调用步骤和最终结果。Workflow 显示 `tests_passed` 时，最后一次 pytest 已通过。
 
@@ -55,7 +57,7 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 | `run_agent.py` | 命令行入口，处理 `start`、`status`、`resume` 和 `history`。 |
 | `experiment/__init__.py` | 声明 Python 包。 |
 | `experiment/agent.py` | 定义 LangGraph 状态、工具循环和审批节点。 |
-| `experiment/workflow.py` | 定义固定步骤、源码定位规则和一次返修分支。 |
+| `experiment/workflow.py` | 定义固定步骤、源码定位规则和复测失败后的修复循环。 |
 | `experiment/aci.py` | 定义模型可调用的本地仓库工具和执行逻辑。 |
 | `experiment/model.py` | 将项目模型配置接到 LangGraph，向模型声明工具。 |
 | `experiment/history.py` | 将本地运行记录整理成索引和可读的 Markdown。 |
@@ -66,12 +68,12 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 | `pytest.ini` | 项目根目录执行 pytest 时收集 Agent 自身的测试。 |
 | `requirements.in`、`requirements.txt` | 分别保存直接依赖和固定版本，含 SQLite checkpoint 组件。 |
 | `.gitignore`、`.env` | 忽略本地运行副本和密钥文件，模型配置保存在已有的 `.env`。 |
-| `runs/<ID>/repo/` | 副本模式下可修改和测试的仓库副本。 |
-| `runs/<ID>/target.json` | 保存策略、写入模式和原仓库的路径，供恢复时使用。 |
-| `runs/INDEX.md`、`runs/<ID>/conversation.md` | 任务总览和单次任务的对话记录。 |
-| `runs/<ID>/checkpoint.sqlite3`、`invocation.lock` | 保存图状态，确保同一个运行 ID 的执行串行。 |
+| `runs/_strategies/<策略>/<ID>/repo/` | 副本模式下可修改和测试的仓库副本。 |
+| `runs/_strategies/<策略>/<ID>/target.json` | 保存策略、写入模式和原仓库的路径，供恢复时使用。 |
+| `runs/INDEX.md`、`runs/_strategies/<策略>/<ID>/conversation.md` | 任务总览和单次任务的对话记录。 |
+| `runs/_strategies/<策略>/<ID>/checkpoint.sqlite3`、`invocation.lock` | 保存图状态，确保同一个运行 ID 的执行串行。 |
 | `runs/.repository-locks/` | 协调同一个原仓库上的直接修复和复制操作。 |
-| `results/logs/<ID>.jsonl` | 从 checkpoint 生成的任务描述、模型动作、工具结果和最终状态。 |
+| `results/logs/<策略>/<ID>.jsonl` | 从 checkpoint 生成的任务描述、模型动作、工具结果和最终状态。 |
 | `SWE_AGENT.md` | 本文。 |
 
 ## 每个函数的作用
@@ -87,6 +89,7 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 | `exclusive_lock` | 在命令执行期间持有 SQLite 独占锁。 |
 | `repository_lock` | 按原仓库路径选择共享锁，避免两个任务交错写入。 |
 | `start_run` | 验证输入、建立运行目录，按所选模式复制仓库或登记原路径。 |
+| `find_run_directory` | 按运行 ID 在策略目录和旧版目录中查找 checkpoint。 |
 | `run_repository` | 读取运行的目标位置、模式和策略，支持早期的 Agent 存档。 |
 | `resume_input` | 检查是否有待执行节点，按需把人工决定放入 `Command(resume=...)`。 |
 | `write_trace` | 从当前 checkpoint 重建 JSONL 日志，再更新任务索引和对话记录。 |
@@ -119,13 +122,13 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 | 函数 | 作用 |
 |---|---|
 | `select_source`、内部 `score` | 从搜索结果中选一个源码文件，优先匹配题目和测试输出。 |
-| `after_tests`、`after_proposal` | 按固定条件选择结束、读源码、审批或记录无效修改。 |
-| `build_workflow` | 编译固定步骤和一次返修分支。 |
+| `after_tests`、`after_prepare_patch`、`after_patch` | 路由到定位、审批、下一条修改、复测或结束。 |
+| `build_workflow` | 编译固定步骤及受工具预算约束的修复循环。 |
 | `run_fixed_tool`、`check_budget` | 发起由流程指定的工具调用并检查步数上限。 |
 | `run_tests` | 执行基线测试或复验，决定是否需要返修。 |
 | `read_test`、`search_source`、`read_source` | 读取失败测试，定位并读取供模型修改的源码。 |
-| `propose_patch` | 把题目、源码和最新 pytest 反馈交给模型，验证生成的修改。 |
-| `apply_patch` | 处理审批结果并记录写入，成功后转到 pytest。 |
+| `propose_patch`、`prepare_patch` | 验证模型返回的工具请求，再按顺序为每条修改准备 diff。 |
+| `apply_patch` | 处理审批结果、记录写入并推进当前请求的位置。 |
 
 ### `experiment/aci.py`
 
@@ -156,7 +159,7 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 | `tests/test_agent.py` | `test_choose_mode_prompts_in_terminal` 验证启动询问。`test_approval_survives_process_exit` 验证两种模式下的批准、拒绝和恢复。`test_resume_after_provider_failure_preserves_completed_steps` 验证中断后续跑。`test_step_limit_ends_before_another_model_call` 核对工具预算。`test_aci_checks_edit_scope_and_replays_approved_write_safely` 检查编辑范围、过期 diff 和重复执行。 |
 | `tests/test_agent.py` | `test_generated_ids_keep_tasks_separate_and_allow_resume` 验证自动编号、拒绝重复编号，以及按原编号恢复各自的任务。 |
 | `tests/test_agent.py` | `test_history_backfills_existing_run_without_inventing_original_repository` 验证旧任务的索引与对话导出。 |
-| `tests/test_agent.py` | `workflow_patch_model` 模拟生成补丁，`test_workflow_executes_fixed_order_and_retries_on_failure` 验证 Workflow 的执行顺序、恢复和一次返修，`test_workflow_obeys_tool_budget` 验证步数上限。 |
+| `tests/test_agent.py` | `workflow_patch_model` 模拟生成补丁，`test_workflow_executes_fixed_order_and_retries_on_failure` 验证执行顺序和恢复，`test_workflow_uses_test_py_to_find_each_failing_source` 验证多轮定位和预算停止。 |
 | `tests/test_agent.py` | `test_model_adapter_sends_tool_schemas_and_decodes_tool_calls` 使用模拟 HTTP 响应验证模型适配器。内部 `fake_provider` 检查请求并返回工具调用，`create_local_model` 建立使用该模拟服务的客户端。 |
 
 ## 本地验证
@@ -165,4 +168,4 @@ Workflow 先跑基线测试。pytest 报告失败用例时，Workflow 会读取�
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
 
-测试用脚本模型模拟工具请求，在独立进程之间验证 SQLite 恢复。实际模型运行使用前面的 `start` 命令，日志会出现在 `results/logs/`。
+测试用脚本模型模拟工具请求，在独立进程之间验证 SQLite 恢复。实际模型运行使用前面的 `start` 命令，日志会出现在 `results/logs/<策略>/`。
