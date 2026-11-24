@@ -1,9 +1,9 @@
 agent_mode start
-python run_agent.py start --repo examples\checkout_chain --issue-file examples\checkout_chain\issue.md --strategy agent --max-steps 20
+python run_agent.py start --repo examples\merge_sort --issue "修改代码中的逻辑错误" --strategy agent --max-steps 20
 python run_agent.py start --repo examples\sort --issue "修改代码中的逻辑错误" --strategy agent --max-steps 20
 
 workflow_mode start
-python run_agent.py start --repo examples\checkout_chain --issue-file examples\checkout_chain\issue.md --strategy workflow --max-steps 20
+python run_agent.py start --repo examples\merge_sort --issue "修改代码中的逻辑错误" --strategy workflow --max-steps 20
 python run_agent.py start --repo examples\sort --issue "修改代码中的逻辑错误" --strategy workflow --max-steps 20
 
 resume_approve
